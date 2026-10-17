@@ -1,0 +1,12 @@
+@import "leaflet/dist/leaflet.css";
+
+.civicfix-map {
+position: relative;
+z-index: 0;
+  width: 100%;
+  height: 360px;
+  min-height: 280px;
+  overflow: hidden;
+  border-radius: 14px;
+  border: 1px solid #dce9e2;
+}

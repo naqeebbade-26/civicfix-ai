@@ -1,0 +1,41 @@
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+*.env
+api.env
+
+# Python virtual environments and cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Databases and private uploads
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+**/uploads/
+
+# Next.js and Node.js
+node_modules/
+.next/
+out/
+.vercel/
+dist/
+coverage/
+
+# Local development files
+.DS_Store
+Thumbs.db
+# Downloaded reference website - not part of CivicFix AI
+/frontend/public/Hackathon final boss.html
+/frontend/public/Hackathon final boss_files/
+
+# Local backups and unused files
+/frontend/app/page-backup.tsx
+/frontend/app/pageb4image.py
+/frontend/public/civicfix-report-illustration.png
+# TypeScript build cache
+*.tsbuildinfo
