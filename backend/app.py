@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, g, send_from_directory
+from flask import Flask, jsonify, request, g, send_from_directory, send_file
 from flask_cors import CORS
 from functools import wraps
 from pathlib import Path
@@ -9,6 +9,8 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from google import genai
 from google.genai import types
 import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import os
 import json
 import io
@@ -20,6 +22,13 @@ DATABASE = BASE_DIR / "civicfix.db"
 UPLOAD_DIR = BASE_DIR / "uploads"
 
 load_dotenv(BASE_DIR / "api.env")
+# On Render, use Render Postgres via DATABASE_URL. Locally, SQLite remains available.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_RENDER = bool(os.getenv("RENDER_SERVICE_ID")) or os.getenv("RENDER", "").lower() == "true"
+if IS_RENDER and not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is required on Render. Create a Render Postgres database and configure its connection URL before deploying."
+    )
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
@@ -66,63 +75,145 @@ token_serializer = URLSafeTimedSerializer(
 # DATABASE
 # ---------------------------------------------------------
 
+class ConnectionAdapter:
+    """Keep existing '?' SQL placeholders working for SQLite and Postgres."""
+
+    def __init__(self, connection, is_postgres=False):
+        self._connection = connection
+        self.is_postgres = is_postgres
+
+    def execute(self, sql, params=()):
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+        return self._connection.execute(sql, params)
+
+    def commit(self):
+        return self._connection.commit()
+
+    def rollback(self):
+        return self._connection.rollback()
+
+    def close(self):
+        return self._connection.close()
+
+
 def get_db_connection():
+    if DATABASE_URL:
+        connection = psycopg.connect(
+            DATABASE_URL, row_factory=dict_row, connect_timeout=10, sslmode="require"
+        )
+        return ConnectionAdapter(connection, is_postgres=True)
+
     connection = sqlite3.connect(DATABASE)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    return ConnectionAdapter(connection, is_postgres=False)
 
 
 def init_db():
     connection = get_db_connection()
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    if connection.is_postgres:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            location TEXT NOT NULL,
-            description TEXT,
-            photo_filename TEXT,
-            ai_description TEXT,
-            priority TEXT DEFAULT 'Medium',
-            priority_reason TEXT,
-            evidence_feedback TEXT,
-            status TEXT DEFAULT 'Submitted',
-            user_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id BIGSERIAL PRIMARY KEY,
+                category TEXT NOT NULL,
+                location TEXT NOT NULL,
+                description TEXT,
+                photo_filename TEXT,
+                photo_data BYTEA,
+                photo_mimetype TEXT,
+                ai_description TEXT,
+                priority TEXT DEFAULT 'Medium',
+                priority_reason TEXT,
+                evidence_feedback TEXT,
+                status TEXT DEFAULT 'Submitted',
+                user_id BIGINT REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    else:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    # Safe migration: add missing columns without deleting existing reports.
-    existing_columns = {
-        row["name"]
-        for row in connection.execute(
-            "PRAGMA table_info(reports)"
-        ).fetchall()
-    }
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                location TEXT NOT NULL,
+                description TEXT,
+                photo_filename TEXT,
+                photo_data BLOB,
+                photo_mimetype TEXT,
+                ai_description TEXT,
+                priority TEXT DEFAULT 'Medium',
+                priority_reason TEXT,
+                evidence_feedback TEXT,
+                status TEXT DEFAULT 'Submitted',
+                user_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
 
-    migrations = {
-        "user_id": "INTEGER",
-        "priority_reason": "TEXT",
-        "evidence_feedback": "TEXT",
-        "ai_description": "TEXT",
-        "photo_filename": "TEXT",
-        "priority": "TEXT DEFAULT 'Medium'",
-        "status": "TEXT DEFAULT 'Submitted'",
-        "created_at": "TEXT",
-    }
+    # Safe migrations: add missing columns without deleting existing reports.
+    if connection.is_postgres:
+        existing_columns = {
+            row["column_name"]
+            for row in connection.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reports'
+            """).fetchall()
+        }
+        migrations = {
+            "user_id": "BIGINT",
+            "priority_reason": "TEXT",
+            "evidence_feedback": "TEXT",
+            "ai_description": "TEXT",
+            "photo_filename": "TEXT",
+            "photo_data": "BYTEA",
+            "photo_mimetype": "TEXT",
+            "priority": "TEXT DEFAULT 'Medium'",
+            "status": "TEXT DEFAULT 'Submitted'",
+            "created_at": "TIMESTAMP",
+        }
+    else:
+        existing_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(reports)").fetchall()
+        }
+        migrations = {
+            "user_id": "INTEGER",
+            "priority_reason": "TEXT",
+            "evidence_feedback": "TEXT",
+            "ai_description": "TEXT",
+            "photo_filename": "TEXT",
+            "photo_data": "BLOB",
+            "photo_mimetype": "TEXT",
+            "priority": "TEXT DEFAULT 'Medium'",
+            "status": "TEXT DEFAULT 'Submitted'",
+            "created_at": "TEXT",
+        }
 
     for column, definition in migrations.items():
         if column not in existing_columns:
@@ -130,48 +221,44 @@ def init_db():
                 f"ALTER TABLE reports ADD COLUMN {column} {definition}"
             )
 
-    connection.execute("""
-        UPDATE reports
-        SET created_at = CURRENT_TIMESTAMP
-        WHERE created_at IS NULL OR created_at = ''
-    """)
+    if connection.is_postgres:
+        connection.execute("""
+            UPDATE reports
+            SET created_at = CURRENT_TIMESTAMP
+            WHERE created_at IS NULL
+        """)
+    else:
+        connection.execute("""
+            UPDATE reports
+            SET created_at = CURRENT_TIMESTAMP
+            WHERE created_at IS NULL OR created_at = ''
+        """)
 
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_reports_user_id ON reports(user_id)"
     )
-
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at)"
     )
 
-    # Create or update the admin account only when both credentials are configured.
+    # Create or update admin only when valid credentials are configured.
     admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
     admin_password = os.getenv("ADMIN_PASSWORD", "")
-    admin_name = os.getenv(
-        "ADMIN_NAME",
-        "CivicFix Administrator"
-    ).strip()
+    admin_name = os.getenv("ADMIN_NAME", "CivicFix Administrator").strip()
 
     if admin_email and admin_password:
         if len(admin_password) < 12:
             app.logger.warning(
                 "Admin account not created: ADMIN_PASSWORD must be at least 12 characters."
             )
-
-        elif not re.fullmatch(
-            r"[^@\s]+@[^@\s]+\.[^@\s]+",
-            admin_email
-        ):
+        elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", admin_email):
             app.logger.warning(
                 "Admin account not created: ADMIN_EMAIL is not a valid email."
             )
-
         else:
             existing_admin = connection.execute(
-                "SELECT id FROM users WHERE email = ?",
-                (admin_email,)
+                "SELECT id FROM users WHERE email = ?", (admin_email,)
             ).fetchone()
-
             password_hash = generate_password_hash(admin_password)
 
             if existing_admin:
@@ -182,9 +269,8 @@ def init_db():
                 """, (
                     admin_name or "CivicFix Administrator",
                     password_hash,
-                    admin_email
+                    admin_email,
                 ))
-
             else:
                 connection.execute("""
                     INSERT INTO users (name, email, password_hash, role)
@@ -210,6 +296,17 @@ def public_user(user):
         "email": user["email"],
         "role": user["role"],
     }
+
+
+def public_report(row):
+    """Return JSON-safe report metadata without binary photo payloads."""
+    result = dict(row)
+    result.pop("photo_data", None)
+    result.pop("photo_mimetype", None)
+    created_at = result.get("created_at")
+    if hasattr(created_at, "isoformat"):
+        result["created_at"] = created_at.isoformat(sep=" ")
+    return result
 
 
 def issue_token(user):
@@ -310,10 +407,27 @@ def home():
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({
-        "success": True,
-        "message": "Backend connection is healthy",
-    })
+    connection = None
+    try:
+        connection = get_db_connection()
+        connection.execute("SELECT 1 AS ok").fetchone()
+        return jsonify({
+            "success": True,
+            "message": "Backend and database connection are healthy",
+            "database": "postgresql" if DATABASE_URL else "sqlite",
+            "database_connected": True,
+        })
+    except Exception:
+        app.logger.exception("Database health check failed")
+        return jsonify({
+            "success": False,
+            "message": "Backend is running but the database connection failed.",
+            "database": "postgresql" if DATABASE_URL else "sqlite",
+            "database_connected": False,
+        }), 503
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 # ---------------------------------------------------------
@@ -367,20 +481,23 @@ def signup():
     connection = get_db_connection()
 
     try:
-        cursor = connection.execute("""
+        insert_sql = """
             INSERT INTO users (name, email, password_hash, role)
             VALUES (?, ?, ?, 'user')
-        """, (
-            name,
-            email,
-            generate_password_hash(password)
-        ))
+        """
+        insert_params = (name, email, generate_password_hash(password))
+        if connection.is_postgres:
+            cursor = connection.execute(insert_sql + " RETURNING id", insert_params)
+            new_user_id = cursor.fetchone()["id"]
+        else:
+            cursor = connection.execute(insert_sql, insert_params)
+            new_user_id = cursor.lastrowid
 
         connection.commit()
 
         user = connection.execute(
             "SELECT * FROM users WHERE id = ?",
-            (cursor.lastrowid,),
+            (new_user_id,),
         ).fetchone()
 
         return jsonify({
@@ -390,7 +507,7 @@ def signup():
             "user": public_user(user),
         }), 201
 
-    except sqlite3.IntegrityError:
+    except (sqlite3.IntegrityError, psycopg.IntegrityError):
         return jsonify({
             "success": False,
             "message": "An account with this email already exists. Please log in.",
@@ -475,7 +592,7 @@ def get_reports():
 
         return jsonify({
             "success": True,
-            "reports": [dict(row) for row in rows],
+            "reports": [public_report(row) for row in rows],
         })
 
     finally:
@@ -566,13 +683,24 @@ def create_report():
         }), 400
 
     photo_filename = f"{uuid.uuid4().hex}{extension}"
-    saved_photo_path = UPLOAD_DIR / photo_filename
+    photo_data = photo.read()
+    if not photo_data:
+        return jsonify({
+            "success": False,
+            "message": "The selected image is empty.",
+        }), 400
+    if len(photo_data) > 10 * 1024 * 1024:
+        return jsonify({
+            "success": False,
+            "message": "Image must be 10 MB or smaller.",
+        }), 400
+
     connection = get_db_connection()
 
     try:
-        photo.save(saved_photo_path)
-
-        cursor = connection.execute("""
+        # Store the image in the database too. Render's application filesystem is
+        # ephemeral, so saving new uploads under ./uploads would lose them on restarts.
+        insert_sql = """
             INSERT INTO reports (
                 user_id,
                 category,
@@ -580,42 +708,50 @@ def create_report():
                 description,
                 ai_description,
                 photo_filename,
+                photo_data,
+                photo_mimetype,
                 priority,
                 priority_reason,
                 evidence_feedback,
                 status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted')
-        """, (
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted')
+        """
+        insert_params = (
             g.current_user["id"],
             category,
             location,
             description,
             ai_description,
             photo_filename,
+            photo_data,
+            photo.mimetype,
             priority,
             priority_reason,
             evidence_feedback,
-        ))
+        )
+        if connection.is_postgres:
+            cursor = connection.execute(insert_sql + " RETURNING id", insert_params)
+            new_report_id = cursor.fetchone()["id"]
+        else:
+            cursor = connection.execute(insert_sql, insert_params)
+            new_report_id = cursor.lastrowid
 
         connection.commit()
 
         row = connection.execute(
             "SELECT * FROM reports WHERE id = ?",
-            (cursor.lastrowid,),
+            (new_report_id,),
         ).fetchone()
 
         return jsonify({
             "success": True,
             "message": "Report saved successfully.",
-            "report": dict(row),
+            "report": public_report(row),
         }), 201
 
     except Exception:
         connection.rollback()
-
-        if saved_photo_path.exists():
-            saved_photo_path.unlink()
 
         app.logger.exception("Failed to save report")
 
@@ -657,11 +793,29 @@ def get_report_photo(report_id):
             "message": "You do not have permission to view this photo.",
         }), 403
 
-    return send_from_directory(
-        str(UPLOAD_DIR),
-        report["photo_filename"],
-        max_age=0,
-    )
+    photo_data = report["photo_data"]
+    if photo_data:
+        mimetype = report["photo_mimetype"] or "application/octet-stream"
+        return send_file(
+            io.BytesIO(bytes(photo_data)),
+            mimetype=mimetype,
+            download_name=report["photo_filename"],
+            max_age=0,
+        )
+
+    # Compatibility fallback for older local SQLite records that stored files on disk.
+    legacy_path = UPLOAD_DIR / report["photo_filename"]
+    if legacy_path.is_file():
+        return send_from_directory(
+            str(UPLOAD_DIR),
+            report["photo_filename"],
+            max_age=0,
+        )
+
+    return jsonify({
+        "success": False,
+        "message": "Photo content is not available in persistent storage.",
+    }), 404
 
 
 # ---------------------------------------------------------
@@ -686,7 +840,7 @@ def admin_get_reports():
 
         return jsonify({
             "success": True,
-            "reports": [dict(row) for row in rows],
+            "reports": [public_report(row) for row in rows],
         })
 
     finally:
@@ -741,7 +895,7 @@ def admin_update_report_status(report_id):
         return jsonify({
             "success": True,
             "message": "Report status updated.",
-            "report": dict(updated),
+            "report": public_report(updated),
         })
 
     finally:
