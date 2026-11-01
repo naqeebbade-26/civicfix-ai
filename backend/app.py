@@ -1005,10 +1005,17 @@ def analyze_image():
                         "five values are strings and return valid JSON only."
                     ),
                 ],
+                                
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="low"
+                    )
+                ),
             )
+            
 
         finally:
-             client.close()
+         client.close()
 
         cleaned = (response.text or "").strip()
 
