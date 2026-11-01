@@ -964,19 +964,16 @@ def analyze_image():
     ),
 )
 
-        uploaded_file = client.files.upload(
-            file=io.BytesIO(image_bytes),
-            config={
-                "mime_type": photo.mimetype,
-                "display_name": secure_filename(photo.filename) or "civic-photo",
-            },
-        )
+    
 
         try:
             response = client.models.generate_content(
                 model="gemma-4-26b-a4b-it",
                 contents=[
-                    uploaded_file,
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type=photo.mimetype,
+                    ),
                     (
                         "Analyze the uploaded image for a visible civic issue. "
                         "Return only one valid JSON object with these exact keys: "
@@ -1011,7 +1008,7 @@ def analyze_image():
             )
 
         finally:
-            client.close()
+             client.close()
 
         cleaned = (response.text or "").strip()
 
